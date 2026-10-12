@@ -1,0 +1,11 @@
+.env
+.env.*
+client_secret*.json
+credentials*.json
+*.log
+*.tmp
+/node_modules/
+/dist/
+/dist-tests/
+# Local deployment records, backups and probe outputs (never commit: they contain account IDs and business data)
+/artifacts/

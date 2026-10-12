@@ -1,0 +1,242 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "CliLoginAndReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "signin:AuthorizeOAuth2Access",
+        "signin:CreateOAuth2Token",
+        "sts:GetCallerIdentity",
+        "cloudformation:Describe*",
+        "cloudformation:List*",
+        "cloudformation:Get*",
+        "cloudformation:ValidateTemplate",
+        "lambda:Get*",
+        "lambda:List*",
+        "cloudwatch:Describe*",
+        "cloudwatch:Get*",
+        "cloudwatch:List*",
+        "logs:Describe*",
+        "logs:Get*",
+        "logs:FilterLogEvents",
+        "logs:StartQuery",
+        "logs:StopQuery",
+        "sqs:Get*",
+        "sqs:List*",
+        "sns:Get*",
+        "sns:List*",
+        "scheduler:Get*",
+        "scheduler:List*",
+        "dynamodb:Describe*",
+        "dynamodb:List*",
+        "ssm:DescribeParameters",
+        "servicequotas:Get*",
+        "servicequotas:List*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DeployTwoStacksNoDelete",
+      "Effect": "Allow",
+      "Action": [
+        "cloudformation:CreateChangeSet",
+        "cloudformation:ExecuteChangeSet",
+        "cloudformation:DeleteChangeSet",
+        "cloudformation:UpdateStack",
+        "cloudformation:CancelUpdateStack",
+        "cloudformation:ContinueUpdateRollback"
+      ],
+      "Resource": [
+        "arn:aws:cloudformation:us-east-1:123456789012:stack/amzshop-prod-control/*",
+        "arn:aws:cloudformation:us-east-2:123456789012:stack/amzshop-prod-order-us-east-2/*"
+      ]
+    },
+    {
+      "Sid": "Functions",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:CreateFunction",
+        "lambda:DeleteFunction",
+        "lambda:UpdateFunctionCode",
+        "lambda:UpdateFunctionConfiguration",
+        "lambda:PublishVersion",
+        "lambda:InvokeFunction",
+        "lambda:TagResource",
+        "lambda:UntagResource",
+        "lambda:PutFunctionEventInvokeConfig",
+        "lambda:UpdateFunctionEventInvokeConfig",
+        "lambda:DeleteFunctionEventInvokeConfig"
+      ],
+      "Resource": "arn:aws:lambda:*:123456789012:function:amzshop-prod-*"
+    },
+    {
+      "Sid": "PortalFunctionUrlOnly",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:CreateFunctionUrlConfig",
+        "lambda:UpdateFunctionUrlConfig",
+        "lambda:DeleteFunctionUrlConfig",
+        "lambda:AddPermission",
+        "lambda:RemovePermission",
+        "lambda:PutFunctionConcurrency",
+        "lambda:DeleteFunctionConcurrency"
+      ],
+      "Resource": "arn:aws:lambda:us-east-1:123456789012:function:amzshop-prod-portal"
+    },
+    {
+      "Sid": "EventSourceMappingsOfOwnFunctions",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:CreateEventSourceMapping",
+        "lambda:UpdateEventSourceMapping",
+        "lambda:DeleteEventSourceMapping"
+      ],
+      "Resource": "*",
+      "Condition": { "ArnLike": { "lambda:FunctionArn": "arn:aws:lambda:*:123456789012:function:amzshop-prod-*" } }
+    },
+    {
+      "Sid": "StackRoles",
+      "Effect": "Allow",
+      "Action": [
+        "iam:GetRole",
+        "iam:GetRolePolicy",
+        "iam:ListRolePolicies",
+        "iam:ListAttachedRolePolicies",
+        "iam:ListRoleTags",
+        "iam:CreateRole",
+        "iam:DeleteRole",
+        "iam:UpdateRole",
+        "iam:UpdateAssumeRolePolicy",
+        "iam:PutRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:TagRole",
+        "iam:UntagRole"
+      ],
+      "Resource": "arn:aws:iam::123456789012:role/amzshop-prod-*"
+    },
+    {
+      "Sid": "PassStackRolesToLambdaAndScheduler",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::123456789012:role/amzshop-prod-*",
+      "Condition": { "StringEquals": { "iam:PassedToService": ["lambda.amazonaws.com", "scheduler.amazonaws.com"] } }
+    },
+    {
+      "Sid": "SchedulesNoGroupDelete",
+      "Effect": "Allow",
+      "Action": [
+        "scheduler:CreateSchedule",
+        "scheduler:UpdateSchedule",
+        "scheduler:DeleteSchedule",
+        "scheduler:CreateScheduleGroup",
+        "scheduler:TagResource",
+        "scheduler:UntagResource"
+      ],
+      "Resource": [
+        "arn:aws:scheduler:us-east-1:123456789012:schedule/amzshop-prod/*",
+        "arn:aws:scheduler:us-east-1:123456789012:schedule-group/amzshop-prod"
+      ]
+    },
+    {
+      "Sid": "AppQueuesAndDlqRedriveNoPurge",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:CreateQueue",
+        "sqs:SetQueueAttributes",
+        "sqs:TagQueue",
+        "sqs:UntagQueue",
+        "sqs:StartMessageMoveTask",
+        "sqs:CancelMessageMoveTask",
+        "sqs:ReceiveMessage",
+        "sqs:DeleteMessage"
+      ],
+      "Resource": "arn:aws:sqs:*:123456789012:amzshop-prod-*"
+    },
+    {
+      "Sid": "SourceQueuesRedriveTargetAndPolicyNoReceive",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:SendMessage",
+        "sqs:SetQueueAttributes"
+      ],
+      "Resource": [
+        "arn:aws:sqs:us-east-2:123456789012:amzn-order-queue",
+        "arn:aws:sqs:us-east-1:123456789012:adsbudget-usage-que"
+      ]
+    },
+    {
+      "Sid": "AlertTopics",
+      "Effect": "Allow",
+      "Action": [
+        "sns:CreateTopic",
+        "sns:SetTopicAttributes",
+        "sns:Subscribe",
+        "sns:Unsubscribe",
+        "sns:Publish",
+        "sns:TagResource",
+        "sns:UntagResource"
+      ],
+      "Resource": "arn:aws:sns:*:123456789012:amzshop-prod-*"
+    },
+    {
+      "Sid": "Alarms",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:PutMetricAlarm",
+        "cloudwatch:DeleteAlarms",
+        "cloudwatch:TagResource",
+        "cloudwatch:UntagResource"
+      ],
+      "Resource": "arn:aws:cloudwatch:*:123456789012:alarm:amzshop-prod-*"
+    },
+    {
+      "Sid": "LogGroups",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:DeleteLogGroup",
+        "logs:PutRetentionPolicy",
+        "logs:TagResource",
+        "logs:UntagResource",
+        "logs:TagLogGroup"
+      ],
+      "Resource": "arn:aws:logs:*:123456789012:log-group:/aws/lambda/amzshop-prod-*"
+    },
+    {
+      "Sid": "StateTableNoDelete",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:GetItem",
+        "dynamodb:BatchGetItem",
+        "dynamodb:Query",
+        "dynamodb:Scan",
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:DeleteItem",
+        "dynamodb:UpdateTable",
+        "dynamodb:UpdateTimeToLive",
+        "dynamodb:TagResource",
+        "dynamodb:UntagResource"
+      ],
+      "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/amzshop-prod-state"
+    },
+    {
+      "Sid": "Parameters",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetParameter",
+        "ssm:GetParameters",
+        "ssm:GetParametersByPath",
+        "ssm:GetParameterHistory",
+        "ssm:PutParameter",
+        "ssm:DeleteParameter",
+        "ssm:DeleteParameters",
+        "ssm:AddTagsToResource",
+        "ssm:RemoveTagsFromResource",
+        "ssm:ListTagsForResource"
+      ],
+      "Resource": "arn:aws:ssm:us-east-1:123456789012:parameter/amzshop/*"
+    }
+  ]
+}

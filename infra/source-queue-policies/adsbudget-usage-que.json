@@ -1,0 +1,21 @@
+{
+  "Version": "2012-10-17",
+  "Id": "AmazonMarketingStreamPolicy",
+  "Statement": [
+    {
+      "Sid": "AllowStreamSendMessage",
+      "Effect": "Allow",
+      "Principal": { "Service": "sns.amazonaws.com" },
+      "Action": "sqs:SendMessage",
+      "Resource": "arn:aws:sqs:us-east-1:123456789012:adsbudget-usage-que",
+      "Condition": { "ArnLike": { "aws:SourceArn": "arn:aws:sns:us-east-1:055588217351:*" } }
+    },
+    {
+      "Sid": "AllowStreamReviewerGetQueueAttributes",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::926844853897:role/ReviewerRole" },
+      "Action": "sqs:GetQueueAttributes",
+      "Resource": "arn:aws:sqs:us-east-1:123456789012:adsbudget-usage-que"
+    }
+  ]
+}

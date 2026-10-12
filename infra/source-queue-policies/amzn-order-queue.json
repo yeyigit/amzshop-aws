@@ -1,0 +1,13 @@
+{
+  "Version": "2012-10-17",
+  "Id": "AmzshopOrderSourceQueuePolicy",
+  "Statement": [
+    {
+      "Sid": "AllowSPAPIAccess",
+      "Effect": "Allow",
+      "Principal": { "AWS": "437568002678" },
+      "Action": ["sqs:GetQueueAttributes", "sqs:SendMessage"],
+      "Resource": "arn:aws:sqs:us-east-2:123456789012:amzn-order-queue"
+    }
+  ]
+}

@@ -1,0 +1,1103 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: AMZShop production runtime; automated inputs are disabled until the one-way cutover.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedPattern: "[a-z0-9-]+"
+  StackRole:
+    Type: String
+    AllowedValues: [CONTROL, ORDER]
+  ControlRegion:
+    Type: String
+  OrderQueueArn:
+    Type: String
+    Default: ""
+  AmsQueueArn:
+    Type: String
+    Default: ""
+  PricingQueueArn:
+    Type: String
+    Default: ""
+  AlertEmail:
+    Type: String
+    Default: ""
+  AutomationState:
+    Type: String
+    Default: DISABLED
+    AllowedValues: [DISABLED, ENABLED]
+  ControlStateTableName:
+    Type: String
+  ControlStateTableArn:
+    Type: String
+  ControlJobsFunctionArn:
+    Type: String
+  ControlSchedulerRoleArn:
+    Type: String
+  ControlSchedulerGroupName:
+    Type: String
+  ControlSchedulerDlqArn:
+    Type: String
+
+Conditions:
+  IsControl: !Equals [!Ref StackRole, CONTROL]
+  IsOrder: !Equals [!Ref StackRole, ORDER]
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+  AutomationEnabled: !Equals [!Ref AutomationState, ENABLED]
+  HasOrderQueue: !And [!Condition IsOrder, !Not [!Equals [!Ref OrderQueueArn, ""]]]
+  HasAmsQueue: !And [!Condition IsControl, !Not [!Equals [!Ref AmsQueueArn, ""]]]
+  HasPricingQueue: !And [!Condition IsControl, !Not [!Equals [!Ref PricingQueueArn, ""]]]
+
+Resources:
+  StateTable:
+    Type: AWS::DynamoDB::Table
+    Condition: IsControl
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub amzshop-${Environment}-state
+      BillingMode: PROVISIONED
+      ProvisionedThroughput: { ReadCapacityUnits: 25, WriteCapacityUnits: 25 }
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      TimeToLiveSpecification: { AttributeName: expiresAt, Enabled: true }
+      SSESpecification: { SSEEnabled: false }
+      Tags:
+        - { Key: Project, Value: AMZShop }
+        - { Key: Environment, Value: !Ref Environment }
+
+  OrderDlq:
+    Type: AWS::SQS::Queue
+    Condition: HasOrderQueue
+    Properties:
+      QueueName: !Sub amzshop-${Environment}-order-dlq
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+  AmsDlq:
+    Type: AWS::SQS::Queue
+    Condition: HasAmsQueue
+    Properties:
+      QueueName: !Sub amzshop-${Environment}-ams-dlq
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+  PricingDlq:
+    Type: AWS::SQS::Queue
+    Condition: HasPricingQueue
+    Properties:
+      QueueName: !Sub amzshop-${Environment}-pricing-dlq
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+  OfferDlq:
+    Type: AWS::SQS::Queue
+    Condition: IsControl
+    Properties:
+      QueueName: !Sub amzshop-${Environment}-offer-dlq
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+  OfferQueue:
+    Type: AWS::SQS::Queue
+    Condition: IsControl
+    Properties:
+      QueueName: !Sub amzshop-${Environment}-offer-events
+      MessageRetentionPeriod: 604800
+      VisibilityTimeout: 1800
+      SqsManagedSseEnabled: true
+      RedrivePolicy: { deadLetterTargetArn: !GetAtt OfferDlq.Arn, maxReceiveCount: 5 }
+  OfferQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Condition: IsControl
+    Properties:
+      Queues: [!Ref OfferQueue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: SellingPartnerApiNotifications
+            Effect: Allow
+            Principal: { AWS: "437568002678" }
+            Action: [sqs:GetQueueAttributes, sqs:SendMessage]
+            Resource: !GetAtt OfferQueue.Arn
+  SchedulerDlq:
+    Type: AWS::SQS::Queue
+    Condition: IsControl
+    Properties:
+      QueueName: !Sub amzshop-${Environment}-scheduler-dlq
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+  SchedulerDlqPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Condition: IsControl
+    Properties:
+      Queues: [!Ref SchedulerDlq]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: !GetAtt SchedulerDlq.Arn
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub amzshop-${Environment}-alerts
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+  AlertDeliveryFailureTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub amzshop-${Environment}-alert-delivery-failures
+  AlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AlertTopic, !Ref AlertDeliveryFailureTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: CloudWatchToMainTopic
+            Effect: Allow
+            Principal: { Service: cloudwatch.amazonaws.com }
+            Action: sns:Publish
+            Resource: !Ref AlertTopic
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+          - Sid: CloudWatchToFailureTopic
+            Effect: Allow
+            Principal: { Service: cloudwatch.amazonaws.com }
+            Action: sns:Publish
+            Resource: !Ref AlertDeliveryFailureTopic
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+  AlertDeliveryFailureEmail:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertDeliveryFailureTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  SchedulerGroup:
+    Type: AWS::Scheduler::ScheduleGroup
+    Condition: IsControl
+    Properties:
+      Name: !Sub amzshop-${Environment}
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Condition: IsControl
+    Properties:
+      RoleName: !Sub amzshop-${Environment}-scheduler
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: invoke-jobs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:amzshop-${Environment}-jobs
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt SchedulerDlq.Arn
+
+  OrderRole:
+    Type: AWS::IAM::Role
+    Condition: HasOrderQueue
+    Properties:
+      RoleName: !Sub amzshop-${Environment}-order
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: order-runtime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/amzshop-${Environment}-order:*
+              - Sid: Parameters
+                Effect: Allow
+                Action: [ssm:GetParameter, ssm:GetParameters, ssm:GetParametersByPath]
+                Resource: !Sub arn:${AWS::Partition}:ssm:${ControlRegion}:${AWS::AccountId}:parameter/amzshop/${Environment}/*
+              - Sid: State
+                Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem]
+                Resource: !Ref ControlStateTableArn
+              - Sid: SourceQueue
+                Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility, sqs:GetQueueAttributes]
+                Resource: !Ref OrderQueueArn
+              - Sid: ContinuationSchedules
+                Effect: Allow
+                Action: [scheduler:CreateSchedule, scheduler:GetSchedule]
+                Resource: !Sub arn:${AWS::Partition}:scheduler:${ControlRegion}:${AWS::AccountId}:schedule/${ControlSchedulerGroupName}/amzshop-*
+              - Sid: PassSchedulerRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Ref ControlSchedulerRoleArn
+                Condition:
+                  StringEquals: { "iam:PassedToService": scheduler.amazonaws.com }
+
+  AmsRole:
+    Type: AWS::IAM::Role
+    Condition: HasAmsQueue
+    Properties:
+      RoleName: !Sub amzshop-${Environment}-ams
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ams-runtime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/amzshop-${Environment}-ams:*
+              - Sid: Parameters
+                Effect: Allow
+                Action: [ssm:GetParameter, ssm:GetParameters, ssm:GetParametersByPath]
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/amzshop/${Environment}/*
+              - Sid: State
+                Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem]
+                Resource: !GetAtt StateTable.Arn
+              - Sid: SourceQueue
+                Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility, sqs:GetQueueAttributes]
+                Resource: !Ref AmsQueueArn
+
+  PricingRole:
+    Type: AWS::IAM::Role
+    Condition: HasPricingQueue
+    Properties:
+      RoleName: !Sub amzshop-${Environment}-pricing
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: pricing-runtime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/amzshop-${Environment}-pricing:*
+              - Sid: Parameters
+                Effect: Allow
+                Action: [ssm:GetParameter, ssm:GetParameters, ssm:GetParametersByPath]
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/amzshop/${Environment}/*
+              - Sid: State
+                Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem]
+                Resource: !GetAtt StateTable.Arn
+              - Sid: SourceQueue
+                Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility, sqs:GetQueueAttributes]
+                Resource: !Ref PricingQueueArn
+
+  OfferRole:
+    Type: AWS::IAM::Role
+    Condition: IsControl
+    Properties:
+      RoleName: !Sub amzshop-${Environment}-offer
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: offer-runtime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/amzshop-${Environment}-offer:*
+              - Sid: Parameters
+                Effect: Allow
+                Action: [ssm:GetParameter, ssm:GetParameters, ssm:GetParametersByPath]
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/amzshop/${Environment}/*
+              - Sid: State
+                Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem]
+                Resource: !GetAtt StateTable.Arn
+              - Sid: SourceQueue
+                Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility, sqs:GetQueueAttributes]
+                Resource: !GetAtt OfferQueue.Arn
+
+  JobsRole:
+    Type: AWS::IAM::Role
+    Condition: IsControl
+    Properties:
+      RoleName: !Sub amzshop-${Environment}-jobs
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: jobs-runtime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/amzshop-${Environment}-jobs:*
+              - Sid: Parameters
+                Effect: Allow
+                Action: [ssm:GetParameter, ssm:GetParameters, ssm:GetParametersByPath]
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/amzshop/${Environment}/*
+              - Sid: State
+                Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query]
+                Resource: !GetAtt StateTable.Arn
+              - Sid: ContinuationSchedules
+                Effect: Allow
+                Action: [scheduler:CreateSchedule, scheduler:GetSchedule]
+                Resource: !Sub arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/amzshop-${Environment}/amzshop-*
+              - Sid: PassSchedulerRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt SchedulerRole.Arn
+                Condition:
+                  StringEquals: { "iam:PassedToService": scheduler.amazonaws.com }
+              - Sid: AsyncFailureDestination
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
+
+  # Shop portal (2026-10-07): read-only. State table reads only; writes limited to its own cache, refresh lease and Feishu usage partitions (enforced by LeadingKeys).
+  PortalRole:
+    Type: AWS::IAM::Role
+    Condition: IsControl
+    Properties:
+      RoleName: !Sub amzshop-${Environment}-portal
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: portal-runtime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/amzshop-${Environment}-portal:*
+              - Sid: Parameters
+                Effect: Allow
+                Action: [ssm:GetParameter, ssm:GetParameters, ssm:GetParametersByPath]
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/amzshop/${Environment}/*
+              - Sid: StateRead
+                Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:Query]
+                Resource: !GetAtt StateTable.Arn
+              - Sid: StateWriteOwnPartitions
+                Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem]
+                Resource: !GetAtt StateTable.Arn
+                Condition:
+                  ForAllValues:StringEquals:
+                    dynamodb:LeadingKeys: [PORTAL_CACHE, "LEASE#portal", FEISHU_USAGE]
+
+  OrderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: HasOrderQueue
+    Properties: { LogGroupName: !Sub "/aws/lambda/amzshop-${Environment}-order", RetentionInDays: 14 }
+  AmsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: HasAmsQueue
+    Properties: { LogGroupName: !Sub "/aws/lambda/amzshop-${Environment}-ams", RetentionInDays: 14 }
+  PricingLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: HasPricingQueue
+    Properties: { LogGroupName: !Sub "/aws/lambda/amzshop-${Environment}-pricing", RetentionInDays: 14 }
+  OfferLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: IsControl
+    Properties: { LogGroupName: !Sub "/aws/lambda/amzshop-${Environment}-offer", RetentionInDays: 14 }
+  JobsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: IsControl
+    Properties: { LogGroupName: !Sub "/aws/lambda/amzshop-${Environment}-jobs", RetentionInDays: 14 }
+  PortalLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: IsControl
+    Properties: { LogGroupName: !Sub "/aws/lambda/amzshop-${Environment}-portal", RetentionInDays: 14 }
+
+  OrderFunction:
+    Type: AWS::Lambda::Function
+    Condition: HasOrderQueue
+    DependsOn: OrderLogGroup
+    Properties:
+      FunctionName: !Sub amzshop-${Environment}-order
+      Runtime: nodejs24.x
+      Architectures: [arm64]
+      Handler: index.handler
+      Role: !GetAtt OrderRole.Arn
+      MemorySize: 256
+      Timeout: !If [AutomationEnabled, 300, 30]
+      Code: { ZipFile: "exports.handler=async()=>{throw new Error('Deploy bundle before enabling input')};" }
+      Environment:
+        Variables:
+          PARAMETER_PREFIX: !Sub /amzshop/${Environment}/
+          CONTROL_REGION: !Ref ControlRegion
+          STATE_TABLE_NAME: !Ref ControlStateTableName
+          JOBS_FUNCTION_ARN: !Ref ControlJobsFunctionArn
+          SCHEDULER_ROLE_ARN: !Ref ControlSchedulerRoleArn
+          SCHEDULER_GROUP_NAME: !Ref ControlSchedulerGroupName
+          SCHEDULER_DLQ_ARN: !Ref ControlSchedulerDlqArn
+  AmsFunction:
+    Type: AWS::Lambda::Function
+    Condition: HasAmsQueue
+    DependsOn: AmsLogGroup
+    Properties:
+      FunctionName: !Sub amzshop-${Environment}-ams
+      Runtime: nodejs24.x
+      Architectures: [arm64]
+      Handler: index.handler
+      Role: !GetAtt AmsRole.Arn
+      MemorySize: 256
+      Timeout: 300
+      Code: { ZipFile: "exports.handler=async()=>{throw new Error('Deploy bundle before enabling input')};" }
+      Environment:
+        Variables:
+          PARAMETER_PREFIX: !Sub /amzshop/${Environment}/
+          CONTROL_REGION: !Ref ControlRegion
+          STATE_TABLE_NAME: !Ref StateTable
+  PricingFunction:
+    Type: AWS::Lambda::Function
+    Condition: HasPricingQueue
+    DependsOn: PricingLogGroup
+    Properties:
+      FunctionName: !Sub amzshop-${Environment}-pricing
+      Runtime: nodejs24.x
+      Architectures: [arm64]
+      Handler: index.handler
+      Role: !GetAtt PricingRole.Arn
+      MemorySize: 512
+      Timeout: 900
+      Code: { ZipFile: "exports.handler=async()=>{throw new Error('Deploy bundle before enabling input')};" }
+      Environment:
+        Variables:
+          PARAMETER_PREFIX: !Sub /amzshop/${Environment}/
+          CONTROL_REGION: !Ref ControlRegion
+          STATE_TABLE_NAME: !Ref StateTable
+  OfferFunction:
+    Type: AWS::Lambda::Function
+    Condition: IsControl
+    DependsOn: OfferLogGroup
+    Properties:
+      FunctionName: !Sub amzshop-${Environment}-offer
+      Runtime: nodejs24.x
+      Architectures: [arm64]
+      Handler: index.handler
+      Role: !GetAtt OfferRole.Arn
+      MemorySize: 256
+      Timeout: 300
+      Code: { ZipFile: "exports.handler=async()=>{throw new Error('Deploy bundle before enabling input')};" }
+      Environment:
+        Variables:
+          PARAMETER_PREFIX: !Sub /amzshop/${Environment}/
+          CONTROL_REGION: !Ref ControlRegion
+          STATE_TABLE_NAME: !Ref StateTable
+  JobsFunction:
+    Type: AWS::Lambda::Function
+    Condition: IsControl
+    DependsOn: JobsLogGroup
+    Properties:
+      FunctionName: !Sub amzshop-${Environment}-jobs
+      Runtime: nodejs24.x
+      Architectures: [arm64]
+      Handler: index.handler
+      Role: !GetAtt JobsRole.Arn
+      MemorySize: 512
+      Timeout: 900
+      Code: { ZipFile: "exports.handler=async()=>{throw new Error('Deploy bundle before enabling input')};" }
+      Environment:
+        Variables:
+          PARAMETER_PREFIX: !Sub /amzshop/${Environment}/
+          CONTROL_REGION: !Ref ControlRegion
+          STATE_TABLE_NAME: !Ref StateTable
+          JOBS_FUNCTION_ARN: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:amzshop-${Environment}-jobs
+          SCHEDULER_ROLE_ARN: !GetAtt SchedulerRole.Arn
+          SCHEDULER_GROUP_NAME: !Ref SchedulerGroup
+          SCHEDULER_DLQ_ARN: !GetAtt SchedulerDlq.Arn
+          ALERT_TOPIC_ARN: !Ref AlertTopic
+          OFFER_QUEUE_ARN: !GetAtt OfferQueue.Arn
+          PORTAL_URL: !GetAtt PortalFunctionUrl.FunctionUrl
+  PortalFunction:
+    Type: AWS::Lambda::Function
+    Condition: IsControl
+    DependsOn: PortalLogGroup
+    Properties:
+      FunctionName: !Sub amzshop-${Environment}-portal
+      Runtime: nodejs24.x
+      Architectures: [arm64]
+      Handler: index.handler
+      Role: !GetAtt PortalRole.Arn
+      MemorySize: 512
+      Timeout: 60
+      ReservedConcurrentExecutions: 2
+      Code: { ZipFile: "exports.handler=async()=>({statusCode:503,headers:{'content-type':'text/plain; charset=utf-8'},body:'portal bundle not deployed'});" }
+      Environment:
+        Variables:
+          PARAMETER_PREFIX: !Sub /amzshop/${Environment}/
+          CONTROL_REGION: !Ref ControlRegion
+          STATE_TABLE_NAME: !Ref StateTable
+  # The only public HTTP entry: AuthType NONE guarded by Feishu login in the app; two resource policies per the Oct 2025 rule (InvokeFunctionUrl + InvokeFunction only via the function URL).
+  PortalFunctionUrl:
+    Type: AWS::Lambda::Url
+    Condition: IsControl
+    Properties:
+      TargetFunctionArn: !GetAtt PortalFunction.Arn
+      AuthType: NONE
+      InvokeMode: BUFFERED
+  PortalUrlPublicInvoke:
+    Type: AWS::Lambda::Permission
+    Condition: IsControl
+    Properties:
+      FunctionName: !Ref PortalFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+  PortalUrlFunctionInvoke:
+    Type: AWS::Lambda::Permission
+    Condition: IsControl
+    Properties:
+      FunctionName: !Ref PortalFunction
+      Action: lambda:InvokeFunction
+      Principal: "*"
+      InvokedViaFunctionUrl: true
+
+  JobsAsyncFailure:
+    Type: AWS::Lambda::EventInvokeConfig
+    Condition: IsControl
+    Properties:
+      FunctionName: !Ref JobsFunction
+      Qualifier: $LATEST
+      MaximumEventAgeInSeconds: 21600
+      MaximumRetryAttempts: 2
+      DestinationConfig:
+        OnFailure: { Destination: !Ref AlertTopic }
+
+  OrderMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Condition: HasOrderQueue
+    Properties:
+      FunctionName: !Ref OrderFunction
+      EventSourceArn: !Ref OrderQueueArn
+      Enabled: !If [AutomationEnabled, true, false]
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 0
+      ScalingConfig: { MaximumConcurrency: 2 }
+      FunctionResponseTypes: [ReportBatchItemFailures]
+  AmsMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Condition: HasAmsQueue
+    Properties:
+      FunctionName: !Ref AmsFunction
+      EventSourceArn: !Ref AmsQueueArn
+      Enabled: !If [AutomationEnabled, true, false]
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 0
+      ScalingConfig: { MaximumConcurrency: 2 }
+      FunctionResponseTypes: [ReportBatchItemFailures]
+  PricingMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Condition: HasPricingQueue
+    Properties:
+      FunctionName: !Ref PricingFunction
+      EventSourceArn: !Ref PricingQueueArn
+      Enabled: !If [AutomationEnabled, true, false]
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 0
+      ScalingConfig: { MaximumConcurrency: 2 }
+      FunctionResponseTypes: [ReportBatchItemFailures]
+  OfferMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Condition: IsControl
+    Properties:
+      FunctionName: !Ref OfferFunction
+      EventSourceArn: !GetAtt OfferQueue.Arn
+      Enabled: !If [AutomationEnabled, true, false]
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 0
+      ScalingConfig: { MaximumConcurrency: 2 }
+      FunctionResponseTypes: [ReportBatchItemFailures]
+
+  ShipmentSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: IsControl
+    Properties:
+      Name: !Sub amzshop-${Environment}-shipment
+      GroupName: !Ref SchedulerGroup
+      State: !Ref AutomationState
+      ScheduleExpression: cron(0 8 * * ? *)
+      ScheduleExpressionTimezone: Asia/Shanghai
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !GetAtt JobsFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"taskType":"shipment","scheduledAt":"<aws.scheduler.scheduled-time>"}'
+        DeadLetterConfig: { Arn: !GetAtt SchedulerDlq.Arn }
+        RetryPolicy: { MaximumEventAgeInSeconds: 3600, MaximumRetryAttempts: 2 }
+  FinanceSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: IsControl
+    Properties:
+      Name: !Sub amzshop-${Environment}-finance
+      GroupName: !Ref SchedulerGroup
+      State: !Ref AutomationState
+      ScheduleExpression: cron(30 8 * * ? *)
+      ScheduleExpressionTimezone: Asia/Shanghai
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !GetAtt JobsFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"taskType":"finance","scheduledAt":"<aws.scheduler.scheduled-time>"}'
+        DeadLetterConfig: { Arn: !GetAtt SchedulerDlq.Arn }
+        RetryPolicy: { MaximumEventAgeInSeconds: 3600, MaximumRetryAttempts: 2 }
+  OrderReconcileSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: IsControl
+    Properties:
+      Name: !Sub amzshop-${Environment}-order-reconcile
+      GroupName: !Ref SchedulerGroup
+      State: !Ref AutomationState
+      ScheduleExpression: cron(30 8 * * ? *)
+      ScheduleExpressionTimezone: Asia/Shanghai
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !GetAtt JobsFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"taskType":"order-reconcile","scheduledAt":"<aws.scheduler.scheduled-time>"}'
+        DeadLetterConfig: { Arn: !GetAtt SchedulerDlq.Arn }
+        RetryPolicy: { MaximumEventAgeInSeconds: 3600, MaximumRetryAttempts: 2 }
+  InventorySchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: IsControl
+    Properties:
+      Name: !Sub amzshop-${Environment}-inventory
+      GroupName: !Ref SchedulerGroup
+      State: !Ref AutomationState
+      ScheduleExpression: cron(0 9 * * ? *)
+      ScheduleExpressionTimezone: Asia/Shanghai
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !GetAtt JobsFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"taskType":"inventory","scheduledAt":"<aws.scheduler.scheduled-time>"}'
+        DeadLetterConfig: { Arn: !GetAtt SchedulerDlq.Arn }
+        RetryPolicy: { MaximumEventAgeInSeconds: 3600, MaximumRetryAttempts: 2 }
+  # The 09:00 ads-decision schedule was retired on 2026-10-09: ads-daily now queues the runaway keyword check itself when its batch completes.
+  AdsDailySchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: IsControl
+    Properties:
+      Name: !Sub amzshop-${Environment}-ads-daily
+      GroupName: !Ref SchedulerGroup
+      State: !Ref AutomationState
+      ScheduleExpression: cron(0 10 * * ? *)
+      ScheduleExpressionTimezone: Asia/Shanghai
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !GetAtt JobsFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"taskType":"ads-daily","scheduledAt":"<aws.scheduler.scheduled-time>"}'
+        DeadLetterConfig: { Arn: !GetAtt SchedulerDlq.Arn }
+        RetryPolicy: { MaximumEventAgeInSeconds: 3600, MaximumRetryAttempts: 2 }
+  CompetitorSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: IsControl
+    Properties:
+      Name: !Sub amzshop-${Environment}-competitor-prices
+      GroupName: !Ref SchedulerGroup
+      State: !Ref AutomationState
+      # Every 2 hours: normal days compare only in the 14:00 round; sale windows compare every round (see README).
+      ScheduleExpression: cron(0 0/2 * * ? *)
+      ScheduleExpressionTimezone: Asia/Shanghai
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !GetAtt JobsFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"taskType":"competitor-prices","scheduledAt":"<aws.scheduler.scheduled-time>"}'
+        DeadLetterConfig: { Arn: !GetAtt SchedulerDlq.Arn }
+        RetryPolicy: { MaximumEventAgeInSeconds: 3600, MaximumRetryAttempts: 2 }
+  PricingSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: IsControl
+    Properties:
+      Name: !Sub amzshop-${Environment}-pricing
+      GroupName: !Ref SchedulerGroup
+      State: !Ref AutomationState
+      ScheduleExpression: cron(0 * * * ? *)
+      ScheduleExpressionTimezone: Asia/Shanghai
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !GetAtt JobsFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"taskType":"pricing","scheduledAt":"<aws.scheduler.scheduled-time>"}'
+        DeadLetterConfig: { Arn: !GetAtt SchedulerDlq.Arn }
+        RetryPolicy: { MaximumEventAgeInSeconds: 3600, MaximumRetryAttempts: 2 }
+  AdsEarlySchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: IsControl
+    Properties:
+      Name: !Sub amzshop-${Environment}-ads-early
+      GroupName: !Ref SchedulerGroup
+      State: !Ref AutomationState
+      ScheduleExpression: cron(0 1 * * ? *)
+      ScheduleExpressionTimezone: America/Los_Angeles
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !GetAtt JobsFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"taskType":"ads-early","scheduledAt":"<aws.scheduler.scheduled-time>"}'
+        DeadLetterConfig: { Arn: !GetAtt SchedulerDlq.Arn }
+        RetryPolicy: { MaximumEventAgeInSeconds: 3600, MaximumRetryAttempts: 2 }
+  # Shop reports (2026-10-09): push yesterday's daily report at LA 00:15; the run itself schedules the 01:45 refresh.
+  StoreReportSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: IsControl
+    Properties:
+      Name: !Sub amzshop-${Environment}-store-report
+      GroupName: !Ref SchedulerGroup
+      State: !Ref AutomationState
+      ScheduleExpression: cron(15 0 * * ? *)
+      ScheduleExpressionTimezone: America/Los_Angeles
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !GetAtt JobsFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"taskType":"store-report","scheduledAt":"<aws.scheduler.scheduled-time>"}'
+        DeadLetterConfig: { Arn: !GetAtt SchedulerDlq.Arn }
+        RetryPolicy: { MaximumEventAgeInSeconds: 3600, MaximumRetryAttempts: 2 }
+  AdsRetentionSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: IsControl
+    Properties:
+      Name: !Sub amzshop-${Environment}-ads-retention
+      GroupName: !Ref SchedulerGroup
+      State: !Ref AutomationState
+      ScheduleExpression: cron(0 5 ? * SUN *)
+      ScheduleExpressionTimezone: Asia/Shanghai
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !GetAtt JobsFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"taskType":"ads-retention","scheduledAt":"<aws.scheduler.scheduled-time>"}'
+        DeadLetterConfig: { Arn: !GetAtt SchedulerDlq.Arn }
+        RetryPolicy: { MaximumEventAgeInSeconds: 3600, MaximumRetryAttempts: 2 }
+  OrderReasonSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: IsControl
+    Properties:
+      Name: !Sub amzshop-${Environment}-order-reason
+      GroupName: !Ref SchedulerGroup
+      State: !Ref AutomationState
+      ScheduleExpression: rate(15 minutes)
+      ScheduleExpressionTimezone: Asia/Shanghai
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !GetAtt JobsFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"taskType":"order-reason","scheduledAt":"<aws.scheduler.scheduled-time>"}'
+        DeadLetterConfig: { Arn: !GetAtt SchedulerDlq.Arn }
+        RetryPolicy: { MaximumEventAgeInSeconds: 3600, MaximumRetryAttempts: 2 }
+  MaintenanceSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: IsControl
+    Properties:
+      Name: !Sub amzshop-${Environment}-maintenance
+      GroupName: !Ref SchedulerGroup
+      State: !Ref AutomationState
+      ScheduleExpression: cron(5 * * * ? *)
+      ScheduleExpressionTimezone: Asia/Shanghai
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !GetAtt JobsFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"taskType":"maintenance","scheduledAt":"<aws.scheduler.scheduled-time>"}'
+        DeadLetterConfig: { Arn: !GetAtt SchedulerDlq.Arn }
+        RetryPolicy: { MaximumEventAgeInSeconds: 3600, MaximumRetryAttempts: 2 }
+  BuyboxWatchSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: IsControl
+    Properties:
+      Name: !Sub amzshop-${Environment}-buybox-watch
+      GroupName: !Ref SchedulerGroup
+      State: !Ref AutomationState
+      ScheduleExpression: cron(20 * * * ? *)
+      ScheduleExpressionTimezone: Asia/Shanghai
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !GetAtt JobsFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"taskType":"buybox-watch","scheduledAt":"<aws.scheduler.scheduled-time>"}'
+        DeadLetterConfig: { Arn: !GetAtt SchedulerDlq.Arn }
+        RetryPolicy: { MaximumEventAgeInSeconds: 3600, MaximumRetryAttempts: 2 }
+  PayoutsSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: IsControl
+    Properties:
+      Name: !Sub amzshop-${Environment}-payouts
+      GroupName: !Ref SchedulerGroup
+      State: !Ref AutomationState
+      ScheduleExpression: cron(30 9 * * ? *)
+      ScheduleExpressionTimezone: Asia/Shanghai
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !GetAtt JobsFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"taskType":"payouts","scheduledAt":"<aws.scheduler.scheduled-time>"}'
+        DeadLetterConfig: { Arn: !GetAtt SchedulerDlq.Arn }
+        RetryPolicy: { MaximumEventAgeInSeconds: 3600, MaximumRetryAttempts: 2 }
+  TrafficAlertSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: IsControl
+    Properties:
+      Name: !Sub amzshop-${Environment}-traffic-alert
+      GroupName: !Ref SchedulerGroup
+      State: !Ref AutomationState
+      ScheduleExpression: cron(0 16 * * ? *)
+      ScheduleExpressionTimezone: Asia/Shanghai
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !GetAtt JobsFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"taskType":"traffic-alert","scheduledAt":"<aws.scheduler.scheduled-time>"}'
+        DeadLetterConfig: { Arn: !GetAtt SchedulerDlq.Arn }
+        RetryPolicy: { MaximumEventAgeInSeconds: 3600, MaximumRetryAttempts: 2 }
+  OfferReconcileSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: IsControl
+    Properties:
+      Name: !Sub amzshop-${Environment}-offer-reconcile
+      GroupName: !Ref SchedulerGroup
+      State: !Ref AutomationState
+      ScheduleExpression: cron(40 * * * ? *)
+      ScheduleExpressionTimezone: Asia/Shanghai
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !GetAtt JobsFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"taskType":"offer-reconcile","scheduledAt":"<aws.scheduler.scheduled-time>"}'
+        DeadLetterConfig: { Arn: !GetAtt SchedulerDlq.Arn }
+        RetryPolicy: { MaximumEventAgeInSeconds: 3600, MaximumRetryAttempts: 2 }
+  BrandWatchSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: IsControl
+    Properties:
+      Name: !Sub amzshop-${Environment}-brand-watch
+      GroupName: !Ref SchedulerGroup
+      State: !Ref AutomationState
+      ScheduleExpression: cron(40 10 * * ? *)
+      ScheduleExpressionTimezone: Asia/Shanghai
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !GetAtt JobsFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"taskType":"brand-watch","scheduledAt":"<aws.scheduler.scheduled-time>"}'
+        DeadLetterConfig: { Arn: !GetAtt SchedulerDlq.Arn }
+        RetryPolicy: { MaximumEventAgeInSeconds: 3600, MaximumRetryAttempts: 2 }
+  ForwarderTrackingSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: IsControl
+    Properties:
+      Name: !Sub amzshop-${Environment}-forwarder-tracking
+      GroupName: !Ref SchedulerGroup
+      State: !Ref AutomationState
+      ScheduleExpression: cron(50 * * * ? *)
+      ScheduleExpressionTimezone: Asia/Shanghai
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !GetAtt JobsFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"taskType":"forwarder-tracking","scheduledAt":"<aws.scheduler.scheduled-time>"}'
+        DeadLetterConfig: { Arn: !GetAtt SchedulerDlq.Arn }
+        RetryPolicy: { MaximumEventAgeInSeconds: 3600, MaximumRetryAttempts: 2 }
+  OrderPricesSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: IsControl
+    Properties:
+      Name: !Sub amzshop-${Environment}-order-prices
+      GroupName: !Ref SchedulerGroup
+      State: !Ref AutomationState
+      ScheduleExpression: cron(15,45 * * * ? *)
+      ScheduleExpressionTimezone: Asia/Shanghai
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !GetAtt JobsFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"taskType":"order-prices","scheduledAt":"<aws.scheduler.scheduled-time>"}'
+        DeadLetterConfig: { Arn: !GetAtt SchedulerDlq.Arn }
+        RetryPolicy: { MaximumEventAgeInSeconds: 3600, MaximumRetryAttempts: 2 }
+  # Account and listing health (2026-10-11): hourly listing status/issue diff, account health report every 6 hours, high-return-rate fee once a day.
+  StoreHealthSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: IsControl
+    Properties:
+      Name: !Sub amzshop-${Environment}-store-health
+      GroupName: !Ref SchedulerGroup
+      State: !Ref AutomationState
+      ScheduleExpression: cron(25 * * * ? *)
+      ScheduleExpressionTimezone: Asia/Shanghai
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !GetAtt JobsFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"taskType":"store-health","scheduledAt":"<aws.scheduler.scheduled-time>"}'
+        DeadLetterConfig: { Arn: !GetAtt SchedulerDlq.Arn }
+        RetryPolicy: { MaximumEventAgeInSeconds: 3600, MaximumRetryAttempts: 2 }
+  # Aged inventory and storage cost (2026-10-11): daily FBA inventory planning report after the 09:00 inventory run.
+  InventoryHealthSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: IsControl
+    Properties:
+      Name: !Sub amzshop-${Environment}-inventory-health
+      GroupName: !Ref SchedulerGroup
+      State: !Ref AutomationState
+      ScheduleExpression: cron(15 9 * * ? *)
+      ScheduleExpressionTimezone: Asia/Shanghai
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !GetAtt JobsFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"taskType":"inventory-health","scheduledAt":"<aws.scheduler.scheduled-time>"}'
+        DeadLetterConfig: { Arn: !GetAtt SchedulerDlq.Arn }
+        RetryPolicy: { MaximumEventAgeInSeconds: 3600, MaximumRetryAttempts: 2 }
+  # Search Query Performance (2026-10-11): daily attempt to fill the latest complete weeks; weekly data lands a few days after Saturday.
+  SqpSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: IsControl
+    Properties:
+      Name: !Sub amzshop-${Environment}-sqp
+      GroupName: !Ref SchedulerGroup
+      State: !Ref AutomationState
+      ScheduleExpression: cron(30 11 * * ? *)
+      ScheduleExpressionTimezone: Asia/Shanghai
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !GetAtt JobsFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"taskType":"sqp","scheduledAt":"<aws.scheduler.scheduled-time>"}'
+        DeadLetterConfig: { Arn: !GetAtt SchedulerDlq.Arn }
+        RetryPolicy: { MaximumEventAgeInSeconds: 3600, MaximumRetryAttempts: 2 }
+  OrderErrors:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasOrderQueue
+    Properties: { AlarmName: !Sub "amzshop-${Environment}-order-errors", Namespace: AWS/Lambda, MetricName: Errors, Dimensions: [{ Name: FunctionName, Value: !Ref OrderFunction }], Statistic: Sum, Period: 300, EvaluationPeriods: 1, Threshold: 1, ComparisonOperator: GreaterThanOrEqualToThreshold, TreatMissingData: notBreaching, AlarmActions: [!Ref AlertTopic] }
+  AmsErrors:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasAmsQueue
+    Properties: { AlarmName: !Sub "amzshop-${Environment}-ams-errors", Namespace: AWS/Lambda, MetricName: Errors, Dimensions: [{ Name: FunctionName, Value: !Ref AmsFunction }], Statistic: Sum, Period: 300, EvaluationPeriods: 1, Threshold: 1, ComparisonOperator: GreaterThanOrEqualToThreshold, TreatMissingData: notBreaching, AlarmActions: [!Ref AlertTopic] }
+  PricingErrors:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasPricingQueue
+    Properties: { AlarmName: !Sub "amzshop-${Environment}-pricing-errors", Namespace: AWS/Lambda, MetricName: Errors, Dimensions: [{ Name: FunctionName, Value: !Ref PricingFunction }], Statistic: Sum, Period: 300, EvaluationPeriods: 1, Threshold: 1, ComparisonOperator: GreaterThanOrEqualToThreshold, TreatMissingData: notBreaching, AlarmActions: [!Ref AlertTopic] }
+  OrderDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasOrderQueue
+    Properties: { AlarmName: !Sub "amzshop-${Environment}-order-dlq", Namespace: AWS/SQS, MetricName: ApproximateNumberOfMessagesVisible, Dimensions: [{ Name: QueueName, Value: !GetAtt OrderDlq.QueueName }], Statistic: Maximum, Period: 300, EvaluationPeriods: 1, Threshold: 1, ComparisonOperator: GreaterThanOrEqualToThreshold, TreatMissingData: notBreaching, AlarmActions: [!Ref AlertTopic] }
+  AmsDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasAmsQueue
+    Properties: { AlarmName: !Sub "amzshop-${Environment}-ams-dlq", Namespace: AWS/SQS, MetricName: ApproximateNumberOfMessagesVisible, Dimensions: [{ Name: QueueName, Value: !GetAtt AmsDlq.QueueName }], Statistic: Maximum, Period: 300, EvaluationPeriods: 1, Threshold: 1, ComparisonOperator: GreaterThanOrEqualToThreshold, TreatMissingData: notBreaching, AlarmActions: [!Ref AlertTopic] }
+  PricingDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasPricingQueue
+    Properties: { AlarmName: !Sub "amzshop-${Environment}-pricing-dlq", Namespace: AWS/SQS, MetricName: ApproximateNumberOfMessagesVisible, Dimensions: [{ Name: QueueName, Value: !GetAtt PricingDlq.QueueName }], Statistic: Maximum, Period: 300, EvaluationPeriods: 1, Threshold: 1, ComparisonOperator: GreaterThanOrEqualToThreshold, TreatMissingData: notBreaching, AlarmActions: [!Ref AlertTopic] }
+  OrderQueueAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasOrderQueue
+    Properties: { AlarmName: !Sub "amzshop-${Environment}-order-queue-age", Namespace: AWS/SQS, MetricName: ApproximateAgeOfOldestMessage, Dimensions: [{ Name: QueueName, Value: !Select [5, !Split [":", !Ref OrderQueueArn]] }], Statistic: Maximum, Period: 300, EvaluationPeriods: 2, DatapointsToAlarm: 2, Threshold: 300, ComparisonOperator: GreaterThanOrEqualToThreshold, TreatMissingData: notBreaching, AlarmActions: [!Ref AlertTopic] }
+  AmsQueueAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasAmsQueue
+    Properties: { AlarmName: !Sub "amzshop-${Environment}-ams-queue-age", Namespace: AWS/SQS, MetricName: ApproximateAgeOfOldestMessage, Dimensions: [{ Name: QueueName, Value: !Select [5, !Split [":", !Ref AmsQueueArn]] }], Statistic: Maximum, Period: 300, EvaluationPeriods: 2, DatapointsToAlarm: 2, Threshold: 600, ComparisonOperator: GreaterThanOrEqualToThreshold, TreatMissingData: notBreaching, AlarmActions: [!Ref AlertTopic] }
+  PricingQueueAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasPricingQueue
+    Properties: { AlarmName: !Sub "amzshop-${Environment}-pricing-queue-age", Namespace: AWS/SQS, MetricName: ApproximateAgeOfOldestMessage, Dimensions: [{ Name: QueueName, Value: !Select [5, !Split [":", !Ref PricingQueueArn]] }], Statistic: Maximum, Period: 300, EvaluationPeriods: 2, DatapointsToAlarm: 2, Threshold: 600, ComparisonOperator: GreaterThanOrEqualToThreshold, TreatMissingData: notBreaching, AlarmActions: [!Ref AlertTopic] }
+  OfferDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsControl
+    Properties: { AlarmName: !Sub "amzshop-${Environment}-offer-dlq", Namespace: AWS/SQS, MetricName: ApproximateNumberOfMessagesVisible, Dimensions: [{ Name: QueueName, Value: !GetAtt OfferDlq.QueueName }], Statistic: Maximum, Period: 300, EvaluationPeriods: 1, Threshold: 1, ComparisonOperator: GreaterThanOrEqualToThreshold, TreatMissingData: notBreaching, AlarmActions: [!Ref AlertTopic] }
+  OfferQueueAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsControl
+    Properties: { AlarmName: !Sub "amzshop-${Environment}-offer-queue-age", Namespace: AWS/SQS, MetricName: ApproximateAgeOfOldestMessage, Dimensions: [{ Name: QueueName, Value: !GetAtt OfferQueue.QueueName }], Statistic: Maximum, Period: 300, EvaluationPeriods: 2, DatapointsToAlarm: 2, Threshold: 600, ComparisonOperator: GreaterThanOrEqualToThreshold, TreatMissingData: notBreaching, AlarmActions: [!Ref AlertTopic] }
+  SchedulerDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsControl
+    Properties: { AlarmName: !Sub "amzshop-${Environment}-scheduler-dlq", Namespace: AWS/SQS, MetricName: ApproximateNumberOfMessagesVisible, Dimensions: [{ Name: QueueName, Value: !GetAtt SchedulerDlq.QueueName }], Statistic: Maximum, Period: 300, EvaluationPeriods: 1, Threshold: 1, ComparisonOperator: GreaterThanOrEqualToThreshold, TreatMissingData: notBreaching, AlarmActions: [!Ref AlertTopic] }
+  DynamoWriteThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsControl
+    Properties: { AlarmName: !Sub "amzshop-${Environment}-state-write-throttle", Namespace: AWS/DynamoDB, MetricName: WriteThrottleEvents, Dimensions: [{ Name: TableName, Value: !Ref StateTable }], Statistic: Sum, Period: 300, EvaluationPeriods: 1, Threshold: 1, ComparisonOperator: GreaterThanOrEqualToThreshold, TreatMissingData: notBreaching, AlarmActions: [!Ref AlertTopic] }
+
+Outputs:
+  StateTableName: { Condition: IsControl, Value: !Ref StateTable }
+  StateTableArn: { Condition: IsControl, Value: !GetAtt StateTable.Arn }
+  OrderFunctionName: { Condition: HasOrderQueue, Value: !Ref OrderFunction }
+  AmsFunctionName: { Condition: HasAmsQueue, Value: !Ref AmsFunction }
+  PricingFunctionName: { Condition: HasPricingQueue, Value: !Ref PricingFunction }
+  JobsFunctionName: { Condition: IsControl, Value: !Ref JobsFunction }
+  JobsFunctionArn: { Condition: IsControl, Value: !GetAtt JobsFunction.Arn }
+  OrderMappingUuid: { Condition: HasOrderQueue, Value: !Ref OrderMapping }
+  AmsMappingUuid: { Condition: HasAmsQueue, Value: !Ref AmsMapping }
+  PricingMappingUuid: { Condition: HasPricingQueue, Value: !Ref PricingMapping }
+  OrderDlqArn: { Condition: HasOrderQueue, Value: !GetAtt OrderDlq.Arn }
+  AmsDlqArn: { Condition: HasAmsQueue, Value: !GetAtt AmsDlq.Arn }
+  PricingDlqArn: { Condition: HasPricingQueue, Value: !GetAtt PricingDlq.Arn }
+  OfferFunctionName: { Condition: IsControl, Value: !Ref OfferFunction }
+  OfferMappingUuid: { Condition: IsControl, Value: !Ref OfferMapping }
+  OfferQueueArn: { Condition: IsControl, Value: !GetAtt OfferQueue.Arn }
+  OfferQueueUrl: { Condition: IsControl, Value: !Ref OfferQueue }
+  OfferDlqArn: { Condition: IsControl, Value: !GetAtt OfferDlq.Arn }
+  SchedulerDlqArn: { Condition: IsControl, Value: !GetAtt SchedulerDlq.Arn }
+  AlertTopicArn: { Value: !Ref AlertTopic }
+  AlertDeliveryFailureTopicArn: { Value: !Ref AlertDeliveryFailureTopic }
+  SchedulerGroupName: { Condition: IsControl, Value: !Ref SchedulerGroup }
+  SchedulerRoleArn: { Condition: IsControl, Value: !GetAtt SchedulerRole.Arn }
+  PortalFunctionName: { Condition: IsControl, Value: !Ref PortalFunction }
+  PortalUrl: { Condition: IsControl, Value: !GetAtt PortalFunctionUrl.FunctionUrl }
